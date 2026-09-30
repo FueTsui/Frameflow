@@ -1080,8 +1080,11 @@ mod tests {
             );
             let raw = execute(&ffmpeg, &args).stdout;
             let samples: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
                 .collect();
             assert_eq!(samples.len(), 8000);
             let base = if base_audio.is_some() { 0.05 } else { 0.0 };

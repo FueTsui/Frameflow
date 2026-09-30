@@ -960,7 +960,7 @@ fn append_encoded_audio(
     if mixed {
         let label = graph.audio_label.as_ref().ok_or("混音未产生音轨。")?;
         push(args, &["-map", &format!("[{label}]")]);
-        for pair in maps.chunks_exact(2) {
+        for pair in maps.as_chunks::<2>().0 {
             let flag = pair[0].to_string_lossy();
             if flag.starts_with("-metadata:s:a:") || flag.starts_with("-disposition:a:") {
                 args.extend_from_slice(pair);
