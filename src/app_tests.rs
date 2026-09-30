@@ -1115,6 +1115,9 @@ fn appearance_settings_track_system_theme_changes() {
         ("跟随系统", Appearance::System, false),
     ] {
         let output = ui.settle();
+        let current = ui.app.prefs.appearance.label();
+        ui.click(text_center(&output, current));
+        let output = ui.settle();
         ui.click(text_center(&output, label));
         ui.settle();
         assert!(ui.app.prefs.appearance == mode);
@@ -1287,8 +1290,6 @@ fn sidebar_settings_opens_roomy_page_with_theme_controls_and_returns_to_workflow
                 "应用主题",
                 "媒体引擎",
                 "跟随系统",
-                "浅色",
-                "深色",
                 "选择引擎文件夹",
                 "重新检测",
             ] {
@@ -1308,14 +1309,17 @@ fn sidebar_settings_opens_roomy_page_with_theme_controls_and_returns_to_workflow
                 ("跟随系统", Appearance::System, system_theme == Theme::Dark),
             ] {
                 let output = ui.settle();
+                let current = ui.app.prefs.appearance.label();
+                ui.click(text_center(&output, current));
+                let output = ui.settle();
                 ui.click(text_center(&output, label));
                 ui.settle();
                 assert!(ui.app.prefs.appearance == mode);
                 assert_eq!(ui.context.style().visuals.dark_mode, dark);
                 assert!(ui.app.page == WorkspacePage::Preferences);
             }
-            let output = ui.scroll_content_to("关于与帮助");
-            let (bounds, clip) = painted_text_bounds(&output, "关于与帮助");
+            let output = ui.scroll_content_to("使用文档");
+            let (bounds, clip) = painted_text_bounds(&output, "使用文档");
             assert!(clip.expand(0.5).contains_rect(bounds));
             ui.click(text_center(&output, Operation::Convert.label()));
             assert!(ui.app.page == WorkspacePage::Files);
@@ -2441,6 +2445,8 @@ fn settings_layout_removes_footer_and_places_software_update_and_help_correctly(
         "收起菜单",
         "展开菜单",
         "FFmpeg 9.0.2 · 已就绪",
+        "帧流 Frameflow",
+        "关于与帮助",
     ] {
         assert!(
             painted_text_bounds_if_present(&output, removed).is_none(),
@@ -2451,6 +2457,79 @@ fn settings_layout_removes_footer_and_places_software_update_and_help_correctly(
     let (software, _) = painted_text_bounds(&output, "软件更新");
     assert!(software.left() > engine.right());
     assert!((software.top() - engine.top()).abs() < 2.);
+    let (theme_label, _) = painted_text_bounds(&output, "应用主题");
+    let (theme_control, _) = painted_text_bounds(&output, "跟随系统");
+    assert!(theme_control.left() > theme_label.right() + 400.);
+    assert!((theme_control.center().y - theme_label.center().y).abs() < 4.);
+    assert!(painted_text_bounds_if_present(&output, "浅色").is_none());
+    assert!(painted_text_bounds_if_present(&output, "深色").is_none());
+    for label in [
+        format!("当前版本 {}", env!("CARGO_PKG_VERSION")),
+        "版本发布页".into(),
+        "GitHub 项目".into(),
+    ] {
+        let (bounds, clip) = painted_text_bounds(&output, &label);
+        assert!(
+            bounds.left() > software.right(),
+            "{label} belongs beside its heading"
+        );
+        assert!(
+            (bounds.center().y - software.center().y).abs() < 4.,
+            "{label}"
+        );
+        assert!(clip.contains_rect(bounds));
+    }
+    let card_bounds = |output: &FullOutput, heading: Rect, palette: Palette| {
+        let mut cards = Vec::new();
+        for clipped in &output.shapes {
+            visit_shapes(&clipped.shape, &mut |shape| {
+                if let egui::Shape::Rect(rect) = shape
+                    && rect.fill == palette.card
+                    && rect.rect.contains_rect(heading)
+                {
+                    cards.push(rect.rect);
+                }
+            });
+        }
+        cards
+            .into_iter()
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .unwrap()
+    };
+    let engine_card = card_bounds(&output, engine, Palette::get(&ui.context));
+    let software_card = card_bounds(&output, software, Palette::get(&ui.context));
+    assert!(
+        (engine_card.bottom() - software_card.bottom()).abs() < 1.,
+        "Engine card {engine_card:?}, software card {software_card:?}"
+    );
+    // Content expansion must grow both cards this frame, then shrink again.
+    ui.app.update_status = UpdateStatus::Failed;
+    ui.app.update_message = "可重试的网络错误。".repeat(60);
+    let expanded = ui.settle();
+    let left = card_bounds(
+        &expanded,
+        painted_text_bounds(&expanded, "FFmpeg 更新").0,
+        Palette::get(&ui.context),
+    );
+    let right = card_bounds(
+        &expanded,
+        painted_text_bounds(&expanded, "软件更新").0,
+        Palette::get(&ui.context),
+    );
+    assert!(left.height() > engine_card.height());
+    assert!((left.height() - right.height()).abs() < 1.);
+    ui.app.update_status = UpdateStatus::Idle;
+    ui.app.update_message.clear();
+    let output = ui.settle();
+    let restored = card_bounds(
+        &output,
+        painted_text_bounds(&output, "FFmpeg 更新").0,
+        Palette::get(&ui.context),
+    );
+    assert!(
+        (restored.height() - engine_card.height()).abs() < 1.,
+        "Card size must not accumulate across frames"
+    );
     let mut automatic = Vec::new();
     for clipped in &output.shapes {
         visit_shapes(&clipped.shape, &mut |shape| {
@@ -2471,10 +2550,13 @@ fn settings_layout_removes_footer_and_places_software_update_and_help_correctly(
     assert!(!persisted.auto_check_app_updates);
     assert!(persisted.auto_check_updates);
     let output = ui.scroll_content_to("使用文档");
-    let (name, _) = painted_text_bounds(&output, "帧流 Frameflow");
+    let (name, _) = painted_text_bounds(&output, "FFmpeg 更新");
     let (help, _) = painted_text_bounds(&output, "使用文档");
     assert!(help.left() > name.right());
     assert!((help.center().y - name.center().y).abs() < 4.);
+    let (download, _) = painted_text_bounds(&output, "FFmpeg 下载页面");
+    assert!(download.left() > name.right());
+    assert!((download.center().y - name.center().y).abs() < 4.);
     let output = ui.settle();
     ui.click(pos2(36., 38.));
     assert!(ui.app.prefs.sidebar_collapsed);

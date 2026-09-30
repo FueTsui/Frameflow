@@ -262,11 +262,21 @@ pub(crate) fn test_release(version: &str) -> Release {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_future_version() -> String {
+    let [major, minor, patch] =
+        stable_version(env!("CARGO_PKG_VERSION")).expect("package uses a stable semantic version");
+    let patch = patch
+        .checked_add(1)
+        .expect("package patch version can advance");
+    format!("{major}.{minor}.{patch}")
+}
+
 #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
 pub(crate) fn test_downloaded_installer(path: PathBuf) -> DownloadedInstaller {
     DownloadedInstaller {
         path,
-        version: "0.2.2".into(),
+        version: test_future_version(),
         sha256: "0".repeat(64),
         size: 512,
     }
@@ -706,6 +716,31 @@ mod tests {
     }
 
     #[test]
+    fn compiled_version_guards_reject_same_version_before_network_or_filesystem_access() {
+        let current = env!("CARGO_PKG_VERSION");
+        let future = test_future_version();
+        assert!(is_newer(&future, current));
+        assert!(!is_newer(current, current));
+        if supported() {
+            let result = download_release(&test_release(current), |_| {
+                panic!("same-version downloads must stop before network progress")
+            });
+            assert!(result.unwrap_err().contains("不高于当前软件版本"));
+        }
+        let installer = DownloadedInstaller {
+            path: PathBuf::from("fixture-does-not-exist.exe"),
+            version: current.into(),
+            sha256: "0".repeat(64),
+            size: 512,
+        };
+        assert!(
+            verified_installer(&installer)
+                .unwrap_err()
+                .contains("不高于当前版本")
+        );
+    }
+
+    #[test]
     fn release_assets_are_exact_published_repository_files() {
         let valid = fixture("0.2.2");
         let release = parse(&valid).unwrap();
@@ -877,12 +912,13 @@ mod tests {
     fn prelaunch_verification_detects_tampering_and_locks_verified_bytes() {
         let directory = Directory::new();
         let bytes = pe_fixture(0x014c);
-        let (pending, mut file) = PendingDownload::create(&directory.0, "0.2.2").unwrap();
+        let version = test_future_version();
+        let (pending, mut file) = PendingDownload::create(&directory.0, &version).unwrap();
         file.write_all(&bytes).unwrap();
         drop(file);
         let installer = DownloadedInstaller {
             path: pending.file.clone(),
-            version: "0.2.2".into(),
+            version,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             size: bytes.len() as u64,
         };

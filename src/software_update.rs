@@ -55,6 +55,18 @@ impl Default for SoftwareUpdate {
 }
 
 impl SoftwareUpdate {
+    /// Trailing header items. The settings card lays these out right to left,
+    /// with wrapping, so status messages remain in the card body below.
+    pub fn header_ui(ui: &mut Ui, p: Palette) {
+        ui.hyperlink_to("GitHub 项目", app_updater::REPOSITORY_URL);
+        ui.hyperlink_to("版本发布页", app_updater::RELEASES_URL);
+        ui.label(
+            RichText::new(concat!("当前版本 ", env!("CARGO_PKG_VERSION")))
+                .size(12.)
+                .color(p.muted),
+        );
+    }
+
     pub fn busy(&self) -> bool {
         matches!(self.state, State::Downloading | State::Installing)
     }
@@ -191,11 +203,6 @@ impl SoftwareUpdate {
         if automatic_response.changed() && *automatic && network {
             self.check(ctx, network);
         }
-        ui.label(
-            RichText::new(concat!("当前版本 ", env!("CARGO_PKG_VERSION")))
-                .size(12.)
-                .color(p.muted),
-        );
         let status = match self.state {
             State::Idle => "从 GitHub 获取软件更新。".into(),
             State::Checking => "正在检查更新…".into(),
@@ -269,10 +276,6 @@ impl SoftwareUpdate {
         if !app_updater::supported() {
             ui.small("自动更新目前支持 Windows x64。");
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.hyperlink_to("版本发布页", app_updater::RELEASES_URL);
-            ui.hyperlink_to("GitHub 项目", app_updater::REPOSITORY_URL);
-        });
     }
 }
 
@@ -287,7 +290,9 @@ mod tests {
         update.check(&ctx, false);
         update
             .tx
-            .send(Message::Checked(Ok(app_updater::test_release("0.2.2"))))
+            .send(Message::Checked(Ok(app_updater::test_release(
+                &app_updater::test_future_version(),
+            ))))
             .unwrap();
         update.poll(&ctx, false, false);
         update.download(&ctx, false, false);
@@ -316,10 +321,11 @@ mod tests {
     fn release_checks_reject_downgrades_and_only_offer_newer_versions() {
         let ctx = egui::Context::default();
         let mut update = SoftwareUpdate::default();
+        let future_version = app_updater::test_future_version();
         for (version, expected) in [
-            ("0.2.0", State::Current),
-            ("0.2.1", State::Current),
-            ("0.2.2", State::Available),
+            ("0.0.0", State::Current),
+            (env!("CARGO_PKG_VERSION"), State::Current),
+            (future_version.as_str(), State::Available),
         ] {
             update.check(&ctx, false);
             update
@@ -355,7 +361,9 @@ mod tests {
         assert_eq!(update.state, State::Idle);
         update
             .tx
-            .send(Message::Checked(Ok(app_updater::test_release("9.0.0"))))
+            .send(Message::Checked(Ok(app_updater::test_release(
+                &app_updater::test_future_version(),
+            ))))
             .unwrap();
         update
             .tx

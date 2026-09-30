@@ -1,6 +1,6 @@
 # Windows 11 Fluent 2 界面设计
 
-版本：0.2.1 · 2026-09-30。
+版本：0.2.2 · 2026-10-01。
 
 界面按 Windows 11 Fluent 2 视觉语言，在现有 Rust / egui 桌面架构上实现。保留系统窗口标题栏、最小化 / 最大化 / 关闭、缩放与系统贴靠，以及原生文件选择器。应用内容由 egui 绘制；本次不是 WinUI 3 迁移，也不使用真实 Mica / Acrylic 材质。
 
@@ -36,7 +36,7 @@
 
 字号层级与基线对齐参考 [Fluent 2 Typography](https://fluent2.microsoft.design/typography)，分组和间距参考 [Fluent 2 Layout](https://fluent2.microsoft.design/layout)。侧栏的展开、紧凑与选中状态参考 [Microsoft NavigationView](https://learn.microsoft.com/en-us/windows/apps/develop/ui/controls/navigationview)。
 
-软件与 FFmpeg 更新在宽窗口并排，窄窗口上下排列；两者各自记住自动检查开关。应用主题无补充描述，帮助链接排列在应用名称右侧。
+软件与 FFmpeg 更新在宽窗口并排，按本帧实际内容自动等高，窄窗口上下排列；两者各自记住自动检查开关。应用主题使用右侧对齐的下拉框。软件版本、发布页和 GitHub 链接位于软件更新标题右侧，使用文档和引擎下载链接位于 FFmpeg 更新标题右侧；更新状态保留在正文，移除重复的应用名称与版本卡片。
 
 ## 无悬浮提示交互
 

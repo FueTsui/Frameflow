@@ -2345,16 +2345,31 @@ impl Frameflow {
                             });
                         });
                 }
-                settings_card(ui, p, "应用主题", "", |ui| {
+                settings_frame(p).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        for mode in [Appearance::System, Appearance::Light, Appearance::Dark] {
-                            if ui
-                                .selectable_value(&mut self.prefs.appearance, mode, mode.label())
-                                .changed()
-                            {
-                                ctx.set_theme(mode.preference());
+                        ui.label(RichText::new("应用主题").size(15.).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let previous = self.prefs.appearance;
+                            egui::ComboBox::from_id_salt("appearance")
+                                .icon(theme::combo_chevron)
+                                .width(160.)
+                                .selected_text(self.prefs.appearance.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in
+                                        [Appearance::System, Appearance::Light, Appearance::Dark]
+                                    {
+                                        ui.selectable_value(
+                                            &mut self.prefs.appearance,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                            if self.prefs.appearance != previous {
+                                ctx.set_theme(self.prefs.appearance.preference());
                             }
-                        }
+                        });
                     });
                 });
                 settings_group(ui, p, "媒体引擎", |ui| {
@@ -2453,44 +2468,42 @@ impl Frameflow {
                 });
                 if ui.available_width() >= 760. {
                     ui.columns(2, |columns| {
-                        columns[0].push_id("engine-update", |ui| {
+                        let mut engine_frame = settings_frame(p).begin(&mut columns[0]);
+                        engine_frame.content_ui.push_id("engine-update", |ui| {
                             self.engine_update_settings(ui, ctx, p)
                         });
-                        columns[1].push_id("software-update", |ui| {
+                        let mut software_frame = settings_frame(p).begin(&mut columns[1]);
+                        software_frame.content_ui.push_id("software-update", |ui| {
+                            self.software_update_settings(ui, ctx, p)
+                        });
+                        // Measure natural content once in this frame. Do not reuse padded
+                        // heights from earlier frames or run interactive contents twice.
+                        let content_bottom = engine_frame
+                            .content_ui
+                            .min_rect()
+                            .bottom()
+                            .max(software_frame.content_ui.min_rect().bottom());
+                        // set_min_height is relative to the current cursor in egui,
+                        // so extend the measured absolute bottom instead of adding space.
+                        engine_frame.content_ui.expand_to_include_y(content_bottom);
+                        software_frame
+                            .content_ui
+                            .expand_to_include_y(content_bottom);
+                        engine_frame.end(&mut columns[0]);
+                        software_frame.end(&mut columns[1]);
+                    });
+                } else {
+                    settings_frame(p).show(ui, |ui| {
+                        ui.push_id("engine-update", |ui| {
+                            self.engine_update_settings(ui, ctx, p)
+                        });
+                    });
+                    settings_frame(p).show(ui, |ui| {
+                        ui.push_id("software-update", |ui| {
                             self.software_update_settings(ui, ctx, p)
                         });
                     });
-                } else {
-                    ui.push_id("engine-update", |ui| {
-                        self.engine_update_settings(ui, ctx, p)
-                    });
-                    ui.push_id("software-update", |ui| {
-                        self.software_update_settings(ui, ctx, p)
-                    });
                 }
-                settings_card(
-                    ui,
-                    p,
-                    "关于与帮助",
-                    "文件在设备上处理，无需上传。",
-                    |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("帧流 Frameflow").size(15.).strong());
-                            ui.add_space(16.);
-                            if ui.link("使用文档").clicked() {
-                                self.open_path("https://github.com/FueTsui/Frameflow#readme");
-                            }
-                            if ui.link("FFmpeg 下载页面").clicked() {
-                                self.open_path("https://ffmpeg.org/download.html");
-                            }
-                        });
-                        ui.label(
-                            RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
-                                .size(12.)
-                                .color(p.muted),
-                        );
-                    },
-                );
             });
     }
 
@@ -2507,166 +2520,173 @@ impl Frameflow {
                 )
             });
         let network = self.background_updates_allowed();
-        settings_group(ui, p, "软件更新", |ui| {
-            self.software_update.ui(
-                ui,
-                ctx,
-                &mut self.prefs.auto_check_app_updates,
-                blocked,
-                network,
-                p,
-            );
+        ui.set_min_width(ui.available_width());
+        settings_header(ui, "软件更新", |ui| {
+            SoftwareUpdate::header_ui(ui, p);
         });
+        self.software_update.ui(
+            ui,
+            ctx,
+            &mut self.prefs.auto_check_app_updates,
+            blocked,
+            network,
+            p,
+        );
     }
 
     fn engine_update_settings(&mut self, ui: &mut Ui, ctx: &egui::Context, p: Palette) {
-        settings_group(ui, p, "FFmpeg 更新", |ui| {
-            let automatic = ui.checkbox(&mut self.prefs.auto_check_updates, "自动检查更新");
-            if automatic.changed()
-                && self.prefs.auto_check_updates
-                && self.background_updates_allowed()
-            {
-                self.check_engine_updates(ctx);
+        ui.set_min_width(ui.available_width());
+        settings_header(ui, "FFmpeg 更新", |ui| {
+            if ui.link("FFmpeg 下载页面").clicked() {
+                self.open_path("https://ffmpeg.org/download.html");
             }
-            let release_version = self
-                .update_release
-                .as_ref()
-                .map(|release| release.version.as_str())
-                .unwrap_or("");
-            let status = match self.update_status {
-                UpdateStatus::Idle => "可检查并更新默认媒体引擎。".into(),
-                UpdateStatus::Checking => "正在检查更新…".into(),
-                UpdateStatus::Available => format!("发现新版本 FFmpeg {release_version}"),
-                UpdateStatus::Current => {
-                    let current = self
-                        .update_current_version
-                        .as_ref()
-                        .map(|version| updater::short_version(version))
-                        .unwrap_or_else(|| release_version.into());
-                    if current == release_version {
-                        format!("默认引擎已是最新版本（{current}）。")
-                    } else {
-                        format!("当前默认引擎：{current}；最新稳定版本：{release_version}。")
-                    }
-                }
-                UpdateStatus::Installing => self.update_message.clone(),
-                UpdateStatus::Installed => format!("默认引擎已更新至 FFmpeg {release_version}。"),
-                UpdateStatus::Failed => format!("更新失败：{}", self.update_message),
-            };
-            ui.horizontal_wrapped(|ui| {
-                if matches!(
-                    self.update_status,
-                    UpdateStatus::Checking | UpdateStatus::Installing
-                ) {
-                    ui.spinner();
-                }
-                ui.add(
-                    egui::Label::new(RichText::new(status).size(13.).color(
-                        if self.update_status == UpdateStatus::Failed {
-                            p.danger
-                        } else {
-                            p.text
-                        },
-                    ))
-                    .wrap(),
-                );
-            });
-            if !updater::supported() {
-                ui.label(
-                    RichText::new("此平台暂不支持内置更新，请手动安装 FFmpeg。")
-                        .size(12.)
-                        .color(p.muted),
-                );
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                let can_check = !matches!(
-                    self.update_status,
-                    UpdateStatus::Checking | UpdateStatus::Installing
-                );
-                ui.add_enabled_ui(can_check, |ui| {
-                    let label = if self.update_status == UpdateStatus::Failed
-                        && self.update_release.is_none()
-                    {
-                        "重试检查"
-                    } else {
-                        "检查更新"
-                    };
-                    if icons::button(
-                        ui,
-                        Icon::Refresh,
-                        label,
-                        "检查默认媒体引擎的新版本",
-                        128.,
-                        false,
-                        p,
-                    )
-                    .clicked()
-                    {
-                        self.check_engine_updates(ctx);
-                    }
-                });
-                if matches!(
-                    self.update_status,
-                    UpdateStatus::Available | UpdateStatus::Failed
-                ) && self.update_release.is_some()
-                {
-                    ui.add_enabled_ui(
-                        !self.engine_change_locked() && !self.checking && !self.dialog_open,
-                        |ui| {
-                            let label = if self.update_status == UpdateStatus::Failed {
-                                "重试更新"
-                            } else {
-                                "下载并更新"
-                            };
-                            if icons::button(
-                                ui,
-                                Icon::Play,
-                                label,
-                                "下载并安装到应用管理的引擎目录",
-                                160.,
-                                true,
-                                p,
-                            )
-                            .clicked()
-                            {
-                                self.install_engine_update(ctx);
-                            }
-                        },
-                    );
-                }
-            });
-            if self.update_status == UpdateStatus::Installing {
-                ui.label(
-                    RichText::new("更新完成后可继续处理媒体文件。")
-                        .size(12.)
-                        .color(p.muted),
-                );
-            } else if self.engine_change_locked() && self.update_release.is_some() {
-                ui.label(
-                    RichText::new("媒体任务完成后可安装更新。")
-                        .size(12.)
-                        .color(p.muted),
-                );
-            }
-            if self.prefs.tools_dir.is_some() {
-                ui.label(
-                    RichText::new("当前使用自定义引擎。更新仅安装默认引擎，不会覆盖自定义文件。")
-                        .size(12.)
-                        .color(p.muted),
-                );
-                if self.installed_update_dir.is_some() || updater::managed_engine_dir().is_some() {
-                    ui.add_enabled_ui(
-                        !self.engine_change_locked() && !self.checking && !self.dialog_open,
-                        |ui| {
-                            if ui.button("使用更新后的默认引擎").clicked() {
-                                self.restore_default_engine(ctx);
-                            }
-                        },
-                    );
-                }
+            if ui.link("使用文档").clicked() {
+                self.open_path("https://github.com/FueTsui/Frameflow#readme");
             }
         });
+        let automatic = ui.checkbox(&mut self.prefs.auto_check_updates, "自动检查更新");
+        if automatic.changed() && self.prefs.auto_check_updates && self.background_updates_allowed()
+        {
+            self.check_engine_updates(ctx);
+        }
+        let release_version = self
+            .update_release
+            .as_ref()
+            .map(|release| release.version.as_str())
+            .unwrap_or("");
+        let status = match self.update_status {
+            UpdateStatus::Idle => "可检查并更新默认媒体引擎。".into(),
+            UpdateStatus::Checking => "正在检查更新…".into(),
+            UpdateStatus::Available => format!("发现新版本 FFmpeg {release_version}"),
+            UpdateStatus::Current => {
+                let current = self
+                    .update_current_version
+                    .as_ref()
+                    .map(|version| updater::short_version(version))
+                    .unwrap_or_else(|| release_version.into());
+                if current == release_version {
+                    format!("默认引擎已是最新版本（{current}）。")
+                } else {
+                    format!("当前默认引擎：{current}；最新稳定版本：{release_version}。")
+                }
+            }
+            UpdateStatus::Installing => self.update_message.clone(),
+            UpdateStatus::Installed => format!("默认引擎已更新至 FFmpeg {release_version}。"),
+            UpdateStatus::Failed => format!("更新失败：{}", self.update_message),
+        };
+        ui.horizontal_wrapped(|ui| {
+            if matches!(
+                self.update_status,
+                UpdateStatus::Checking | UpdateStatus::Installing
+            ) {
+                ui.spinner();
+            }
+            ui.add(
+                egui::Label::new(RichText::new(status).size(13.).color(
+                    if self.update_status == UpdateStatus::Failed {
+                        p.danger
+                    } else {
+                        p.text
+                    },
+                ))
+                .wrap(),
+            );
+        });
+        if !updater::supported() {
+            ui.label(
+                RichText::new("此平台暂不支持内置更新，请手动安装 FFmpeg。")
+                    .size(12.)
+                    .color(p.muted),
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            let can_check = !matches!(
+                self.update_status,
+                UpdateStatus::Checking | UpdateStatus::Installing
+            );
+            ui.add_enabled_ui(can_check, |ui| {
+                let label = if self.update_status == UpdateStatus::Failed
+                    && self.update_release.is_none()
+                {
+                    "重试检查"
+                } else {
+                    "检查更新"
+                };
+                if icons::button(
+                    ui,
+                    Icon::Refresh,
+                    label,
+                    "检查默认媒体引擎的新版本",
+                    128.,
+                    false,
+                    p,
+                )
+                .clicked()
+                {
+                    self.check_engine_updates(ctx);
+                }
+            });
+            if matches!(
+                self.update_status,
+                UpdateStatus::Available | UpdateStatus::Failed
+            ) && self.update_release.is_some()
+            {
+                ui.add_enabled_ui(
+                    !self.engine_change_locked() && !self.checking && !self.dialog_open,
+                    |ui| {
+                        let label = if self.update_status == UpdateStatus::Failed {
+                            "重试更新"
+                        } else {
+                            "下载并更新"
+                        };
+                        if icons::button(
+                            ui,
+                            Icon::Play,
+                            label,
+                            "下载并安装到应用管理的引擎目录",
+                            160.,
+                            true,
+                            p,
+                        )
+                        .clicked()
+                        {
+                            self.install_engine_update(ctx);
+                        }
+                    },
+                );
+            }
+        });
+        if self.update_status == UpdateStatus::Installing {
+            ui.label(
+                RichText::new("更新完成后可继续处理媒体文件。")
+                    .size(12.)
+                    .color(p.muted),
+            );
+        } else if self.engine_change_locked() && self.update_release.is_some() {
+            ui.label(
+                RichText::new("媒体任务完成后可安装更新。")
+                    .size(12.)
+                    .color(p.muted),
+            );
+        }
+        if self.prefs.tools_dir.is_some() {
+            ui.label(
+                RichText::new("当前使用自定义引擎。更新仅安装默认引擎，不会覆盖自定义文件。")
+                    .size(12.)
+                    .color(p.muted),
+            );
+            if self.installed_update_dir.is_some() || updater::managed_engine_dir().is_some() {
+                ui.add_enabled_ui(
+                    !self.engine_change_locked() && !self.checking && !self.dialog_open,
+                    |ui| {
+                        if ui.button("使用更新后的默认引擎").clicked() {
+                            self.restore_default_engine(ctx);
+                        }
+                    },
+                );
+            }
+        }
     }
 
     fn render_ui(&mut self, ctx: &egui::Context, p: Palette) {
@@ -3152,18 +3172,33 @@ fn settings_card(ui: &mut Ui, p: Palette, title: &str, help: &str, add: impl FnO
         });
 }
 
-fn settings_group(ui: &mut Ui, p: Palette, title: &str, add: impl FnOnce(&mut Ui)) {
+fn settings_frame(p: Palette) -> Frame {
     Frame::new()
         .fill(p.card)
         .stroke(Stroke::new(1_f32, p.line))
         .corner_radius(8)
         .inner_margin(16)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(RichText::new(title).size(16.).strong());
-            ui.add_space(8.);
-            add(ui);
-        });
+}
+
+fn settings_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new(title).size(16.).strong());
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 0.),
+            Layout::right_to_left(Align::Center).with_main_wrap(true),
+            trailing,
+        );
+    });
+    ui.add_space(8.);
+}
+
+fn settings_group(ui: &mut Ui, p: Palette, title: &str, add: impl FnOnce(&mut Ui)) {
+    settings_frame(p).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(RichText::new(title).size(16.).strong());
+        ui.add_space(8.);
+        add(ui);
+    });
 }
 
 fn operation_icon(op: Operation) -> Icon {
