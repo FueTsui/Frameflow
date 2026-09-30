@@ -124,15 +124,16 @@ ffprobe -version
 
 ### macOS
 
-已安装 Homebrew 时，可按照 [Homebrew 的 FFmpeg 软件包说明](https://formulae.brew.sh/formula/ffmpeg) 安装：
+已安装 Homebrew 时，使用包含 Vorbis 和字幕烧录支持的 [FFmpeg 完整软件包](https://formulae.brew.sh/formula/ffmpeg-full)：
 
 ```bash
-brew install ffmpeg
+brew install ffmpeg-full
+export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"
 ffmpeg -version
 ffprobe -version
 ```
 
-应用会检查 `/opt/homebrew/bin` 和 `/usr/local/bin`，支持从 Finder 启动时识别常见 Homebrew 安装。也可在设置里指定其他 FFmpeg 文件夹。所用编码器和容器的可用性取决于实际安装的 FFmpeg 构建。
+`ffmpeg-full` 不自动链接到默认命令目录。从 Finder 启动应用时，请在设置中选择 `brew --prefix ffmpeg-full` 输出路径下的 `bin` 文件夹。应用也会检查 `/opt/homebrew/bin` 和 `/usr/local/bin`；所用编码器和容器的可用性取决于实际安装的 FFmpeg 构建。
 
 ## 本地开发
 

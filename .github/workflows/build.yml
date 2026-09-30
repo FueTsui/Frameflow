@@ -60,9 +60,16 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install ffmpeg
+          brew install ffmpeg-full
+          ffmpegDirectory="$(brew --prefix ffmpeg-full)/bin"
+          echo "$ffmpegDirectory" >> "$GITHUB_PATH"
+          export PATH="$ffmpegDirectory:$PATH"
           ffmpeg -version
           ffprobe -version
+          ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/ffmpeg-encoders.txt"
+          ffmpeg -hide_banner -filters > "$RUNNER_TEMP/ffmpeg-filters.txt"
+          grep -q 'libvorbis' "$RUNNER_TEMP/ffmpeg-encoders.txt"
+          grep -q ' subtitles ' "$RUNNER_TEMP/ffmpeg-filters.txt"
       - name: Unit tests
         run: cargo test --locked --target ${{ matrix.target }}
       - name: Package Windows
