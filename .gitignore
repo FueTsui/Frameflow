@@ -1,0 +1,10 @@
+/target/
+/dist/
+/tools/
+/bin/
+.DS_Store
+Thumbs.db
+*.log
+*.pdb
+__pycache__/
+*.py[cod]

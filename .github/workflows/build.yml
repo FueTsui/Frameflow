@@ -1,0 +1,93 @@
+name: Build desktop apps
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - label: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+          - label: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Install FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg installation failed ($LASTEXITCODE)." }
+          Import-Module "$env:ChocolateyInstall/helpers/chocolateyProfile.psm1"
+          Update-SessionEnvironment
+          $ffmpegDirectory = Split-Path -Parent (Get-Command ffmpeg -ErrorAction Stop).Source
+          $ffmpegDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg is not runnable.' }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw 'FFprobe is not runnable.' }
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install ffmpeg
+          ffmpeg -version
+          ffprobe -version
+      - name: Unit tests
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed.' }
+          $engine = Get-ChildItem -LiteralPath "$env:ChocolateyInstall/lib/ffmpeg" -Filter ffmpeg.exe -File -Recurse |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'ffprobe.exe') } |
+            Select-Object -First 1
+          if (-not $engine) { throw 'The actual FFmpeg and FFprobe binaries were not found.' }
+          ./scripts/build-windows.ps1 -Target '${{ matrix.target }}' -FFmpegDirectory $engine.DirectoryName
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/build-macos.sh '${{ matrix.target }}'
+      - name: Upload release packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: Frameflow-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

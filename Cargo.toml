@@ -1,0 +1,29 @@
+[package]
+name = "frameflow"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.88"
+description = "A quiet, native FFmpeg workspace for Windows and macOS"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+rfd = "0.15.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+[build-dependencies]
+winresource = "0.1.31"
