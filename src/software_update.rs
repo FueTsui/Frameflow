@@ -71,6 +71,12 @@ impl SoftwareUpdate {
         matches!(self.state, State::Downloading | State::Installing)
     }
 
+    /// Installing has already handed control to the external installer and must
+    /// allow its explicit request to close the application.
+    pub fn downloading(&self) -> bool {
+        self.state == State::Downloading
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context, automatic: bool, network: bool) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
@@ -282,6 +288,21 @@ impl SoftwareUpdate {
 #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_waits_for_download_but_allows_external_installer_handoff() {
+        let mut update = SoftwareUpdate {
+            state: State::Downloading,
+            ..Default::default()
+        };
+        assert!(update.downloading());
+        assert!(update.busy());
+        update.state = State::Ready;
+        assert!(!update.downloading());
+        update.state = State::Installing;
+        assert!(!update.downloading());
+        assert!(update.busy());
+    }
 
     #[test]
     fn completed_download_waits_for_explicit_install_and_does_not_close_the_app() {

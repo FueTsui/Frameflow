@@ -195,7 +195,11 @@ pub fn latest_release() -> Result<Release, String> {
 
 fn engine_root() -> Option<PathBuf> {
     let path = supported().then(|| std::env::var_os("LOCALAPPDATA"))??;
-    Some(PathBuf::from(path).join("Frameflow/engines"))
+    engine_root_from_local(Path::new(&path))
+}
+
+fn engine_root_from_local(local: &Path) -> Option<PathBuf> {
+    local.is_absolute().then(|| local.join("Frameflow/engines"))
 }
 
 fn active_engine(root: &Path) -> Option<ActiveEngine> {
@@ -337,7 +341,26 @@ fn update_lock(root: &Path) -> Result<File, String> {
     }
     options
         .open(root.join("update.lock"))
-        .map_err(|e| format!("无法开始更新，可能另一个窗口正在更新：{e}"))
+        .map_err(|error| update_lock_error(root, &error))
+}
+
+fn engine_storage_error(action: &str, path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{action}：当前用户没有引擎目录的访问权限（{}）。请检查该用户目录的权限。",
+            path.display()
+        )
+    } else {
+        format!("{action}（{}）：{error}", path.display())
+    }
+}
+
+fn update_lock_error(root: &Path, error: &std::io::Error) -> String {
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return "另一个窗口正在更新引擎，请等待该更新完成后重试。".into();
+    }
+    engine_storage_error("无法锁定引擎更新目录", root, error)
 }
 
 fn download_archive(
@@ -645,7 +668,11 @@ fn install_from_reader(
 ) -> Result<PathBuf, String> {
     stable_version(&release.version)?;
     parse_sha256(&release.sha256)?;
-    fs::create_dir_all(root).map_err(|e| format!("无法创建引擎目录：{e}"))?;
+    if !root.is_absolute() {
+        return Err("用户引擎目录必须为绝对路径。".into());
+    }
+    fs::create_dir_all(root)
+        .map_err(|error| engine_storage_error("无法创建引擎目录", root, &error))?;
     let _lock = update_lock(root)?;
     clean_abandoned_staging(root)?;
     if let Some(active) = active_engine(root)
@@ -654,7 +681,8 @@ fn install_from_reader(
         return Err("当前已安装相同或更新版本，取消更新。".into());
     }
     let staging = Staging(root.join(format!(".staging-{}", unique_suffix())));
-    fs::create_dir(&staging.0).map_err(|e| e.to_string())?;
+    fs::create_dir(&staging.0)
+        .map_err(|error| engine_storage_error("无法创建引擎暂存目录", &staging.0, &error))?;
     let archive = staging.0.join("engine.zip");
     download_archive(input, &archive, &release.sha256, progress)?;
     progress("正在解压并验证引擎…".into());
@@ -731,6 +759,35 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn engine_storage_requires_absolute_user_directory() {
+        assert!(engine_root_from_local(Path::new("")).is_none());
+        assert!(engine_root_from_local(Path::new("relative")).is_none());
+        let local = std::env::temp_dir();
+        assert_eq!(
+            engine_root_from_local(&local),
+            Some(local.join("Frameflow/engines"))
+        );
+    }
+
+    #[test]
+    fn lock_permission_error_is_not_reported_as_another_updater() {
+        let root = std::env::temp_dir();
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = update_lock_error(&root, &error);
+        assert!(message.contains("当前用户没有引擎目录的访问权限"));
+        assert!(!message.contains("另一个窗口"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lock_sharing_violation_is_reported_as_another_updater() {
+        let root = std::env::temp_dir();
+        let error = std::io::Error::from_raw_os_error(32);
+        let message = update_lock_error(&root, &error);
+        assert!(message.contains("另一个窗口正在更新引擎"));
+        assert!(!message.contains("访问权限"));
+    }
     struct TempRoot(PathBuf);
     impl TempRoot {
         fn new() -> Self {

@@ -246,7 +246,7 @@ FFmpeg SHA-256: $($bundledFFmpeg.Metadata.sha256)
 ffprobe SHA-256: $($bundledFFprobe.Metadata.sha256)
 FFmpeg license: GPL-3.0-or-later; see docs/FFmpeg-GPL-3.0.txt and tools/*-license.txt.
 Installer: per-user; administrator privileges not required; uninstall retains user preferences.
-Default installation directory: C:\Programs\Frameflow
+Default installation directory: %LOCALAPPDATA%\Programs\Frameflow
 "@ | Set-Content -LiteralPath (Join-Path $packageRoot 'BUILD_INFO.txt') -Encoding UTF8
     [ordered]@{
         version = $version
@@ -261,7 +261,7 @@ Default installation directory: C:\Programs\Frameflow
         ffmpeg_license = 'GPL-3.0-or-later'
         ffmpeg_source = $ffmpegSource
         installer_scope = 'per-user'
-        installer_default_directory = 'C:\Programs\Frameflow'
+        installer_default_directory = '%LOCALAPPDATA%\Programs\Frameflow'
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $packageRoot 'BUILD_INFO.json') -Encoding UTF8
 
     $stagedArchive = Join-Path $stageRoot "$packageName.zip"

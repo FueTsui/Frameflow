@@ -319,11 +319,23 @@ fn has_link(metadata: &fs::Metadata) -> bool {
 }
 
 fn checked_directory(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| "无法访问更新目录。".to_string())?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| update_storage_error("无法访问更新目录", path, &error))?;
     if !metadata.is_dir() || has_link(&metadata) {
         return Err("更新目录不能是链接或普通文件。".into());
     }
     Ok(())
+}
+
+fn update_storage_error(action: &str, path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{action}：当前用户没有访问权限（{}）。请检查该用户目录的权限。",
+            path.display()
+        )
+    } else {
+        format!("{action}（{}）：{error}", path.display())
+    }
 }
 
 fn updates_root() -> Result<PathBuf, String> {
@@ -338,7 +350,7 @@ fn updates_root() -> Result<PathBuf, String> {
         match fs::create_dir(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err("无法创建用户更新目录。".into()),
+            Err(error) => return Err(update_storage_error("无法创建用户更新目录", &path, &error)),
         }
         checked_directory(&path)?;
     }
@@ -367,7 +379,8 @@ struct PendingDownload {
 impl PendingDownload {
     fn create(root: &Path, version: &str) -> Result<(Self, File), String> {
         let directory = root.join(format!("{version}-{}", unique_suffix()));
-        fs::create_dir(&directory).map_err(|_| "无法创建本次更新目录。".to_string())?;
+        fs::create_dir(&directory)
+            .map_err(|error| update_storage_error("无法创建本次更新目录", &directory, &error))?;
         let mut pending = Self {
             file: directory.join(filename(version)),
             directory,
@@ -383,7 +396,7 @@ impl PendingDownload {
         }
         let file = options
             .open(&pending.file)
-            .map_err(|_| "无法创建安装包文件。".to_string())?;
+            .map_err(|error| update_storage_error("无法创建安装包文件", &pending.file, &error))?;
         pending.owns_file = true;
         Ok((pending, file))
     }
@@ -610,11 +623,54 @@ fn install_directory(install_dir: &Path, current_exe: &Path) -> Result<PathBuf, 
     Ok(install_dir.to_owned())
 }
 
+fn check_install_directory_writable(directory: &Path) -> Result<(), String> {
+    // Check before the UI exits. A successful setup spawn does not imply that a
+    // per-user installer can write into a legacy/protected installation directory.
+    for target in [directory.to_owned(), directory.join("tools")] {
+        let probe = target.join(format!(".frameflow-update-check-{}", unique_suffix()));
+        let result = match fs::metadata(&target) {
+            // Only an absent tools directory can be skipped. An access-denied
+            // metadata read must not be mistaken for a missing directory.
+            Err(error) if target != directory && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => Err(error),
+            Ok(_) => OpenOptions::new().write(true).create_new(true).open(&probe),
+        };
+        match result {
+            Ok(file) => {
+                drop(file);
+                fs::remove_file(&probe).map_err(|error| {
+                    format!(
+                        "无法清理安装目录的更新检查文件（{}）：{error}",
+                        probe.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(format!(
+                    "当前用户没有安装目录的写入权限（{}）。应用将保持打开。请关闭应用后手动以管理员身份运行已下载的安装包，并选择此安装目录；也可安装到用户目录。",
+                    target.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "安装目录不可写（{}）：{error}。应用将保持打开。",
+                    target.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn launch_installer(installer: &DownloadedInstaller, install_dir: &Path) -> Result<(), String> {
     require_supported()?;
     let current_exe = std::env::current_exe().map_err(|_| "无法确定当前程序位置。")?;
     let directory = install_directory(install_dir, &current_exe)?;
     let verified_file = verified_installer(installer)?;
+    check_install_directory_writable(&directory)
+        .map_err(|message| format!("{message}\n安装包：{}", installer.path.display()))?;
     let mut directory_arg = std::ffi::OsString::from("/DIR=");
     directory_arg.push(directory);
     let mut command = Command::new(&installer.path);
@@ -906,6 +962,28 @@ mod tests {
         assert!(install_directory(&directory.0, &executable).is_ok());
         assert!(install_directory(&other.0, &executable).is_err());
         assert!(install_directory(Path::new("relative"), &executable).is_err());
+    }
+
+    #[test]
+    fn install_write_check_removes_probes_and_preserves_existing_files() {
+        let directory = Directory::new();
+        fs::create_dir(directory.0.join("tools")).unwrap();
+        fs::write(directory.0.join("notes.txt"), b"keep").unwrap();
+        check_install_directory_writable(&directory.0).unwrap();
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(directory.0.join("tools")).unwrap().count(), 0);
+        assert_eq!(fs::read(directory.0.join("notes.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn install_write_check_catches_unusable_bundled_tools_directory() {
+        let directory = Directory::new();
+        fs::write(directory.0.join("tools"), b"user file").unwrap();
+        let error = check_install_directory_writable(&directory.0).unwrap_err();
+        assert!(error.contains("安装目录不可写"));
+        assert!(error.contains("应用将保持打开"));
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert_eq!(fs::read(directory.0.join("tools")).unwrap(), b"user file");
     }
 
     #[test]

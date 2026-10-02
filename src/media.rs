@@ -10,14 +10,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +202,110 @@ fn command(program: &Path) -> Command {
     cmd
 }
 
+/// `Child` does not terminate on drop. Keep the process owned even if a worker or
+/// its progress callback unwinds, so staging cleanup runs only after it is reaped.
+struct ChildGuard(Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Bound both pipes and the complete operation, including EOF after process exit.
+/// FFprobe can stall on damaged media or produce very large metadata/tag output.
+fn bounded_output(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<Output, String> {
+    let mut child = ChildGuard(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("无法启动 FFprobe：{error}"))?,
+    );
+    let stdout = child.stdout.take().ok_or("无法读取 FFprobe 输出。")?;
+    let stderr = child.stderr.take().ok_or("无法读取 FFprobe 错误信息。")?;
+    let (sender, receiver) = mpsc::channel();
+    let read = |reader: Box<dyn Read + Send>, limit: usize, is_stdout, sender: mpsc::Sender<_>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("读取 FFprobe 输出失败：{error}"))
+                .and_then(|_| {
+                    if bytes.len() > limit {
+                        Err("FFprobe 输出超过大小限制，请检查媒体文件或重新选择引擎。".into())
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = sender.send((is_stdout, result));
+        });
+    };
+    read(Box::new(stdout), stdout_limit, true, sender.clone());
+    read(Box::new(stderr), stderr_limit, false, sender);
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|error| format!("无法读取 FFprobe 状态：{error}"))?;
+        }
+        match (status, stdout, stderr) {
+            (Some(status), Some(stdout), Some(stderr)) => {
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            (pending_status, pending_stdout, pending_stderr) => {
+                status = pending_status;
+                stdout = pending_stdout;
+                stderr = pending_stderr;
+            }
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(
+                "媒体解析超时，FFprobe 已停止。请检查文件是否损坏或存储设备是否可用。".into(),
+            );
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(25))) {
+            Ok((true, result)) => stdout = Some(result?),
+            Ok((false, result)) => stderr = Some(result?),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // An executable can close both pipes and keep running. Still honor the deadline.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+        }
+    }
+}
+
 /// Test real encoder initialization, not merely the compiled encoder list.
 /// Run only on the engine discovery worker. Each child is bounded and reaped.
 pub fn detect_gpu_encoders(tools: &Toolchain) -> Vec<(VideoEncoder, VideoCodec)> {
@@ -231,7 +335,7 @@ pub fn detect_gpu_encoders(tools: &Toolchain) -> Vec<(VideoEncoder, VideoCodec)>
             );
             video_encoding(&mut args, "mkv", &settings);
             push(&mut args, &["-f", "null", "-"]);
-            let Ok(mut child) = command(&tools.ffmpeg)
+            let Ok(child) = command(&tools.ffmpeg)
                 .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -239,6 +343,7 @@ pub fn detect_gpu_encoders(tools: &Toolchain) -> Vec<(VideoEncoder, VideoCodec)>
             else {
                 continue;
             };
+            let mut child = ChildGuard(child);
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -386,18 +491,21 @@ pub fn probe(tools: &Toolchain, path: &Path) -> Result<MediaInfo, String> {
     if !metadata.is_file() {
         return Err("请选择媒体文件，不能使用文件夹。".into());
     }
-    let output = command(&tools.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-show_format",
-            "-show_streams",
-            "-of",
-            "json",
-        ])
-        .arg(&path)
-        .output()
-        .map_err(|e| format!("无法启动 FFprobe：{e}"))?;
+    let output = bounded_output(
+        command(&tools.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-of",
+                "json",
+            ])
+            .arg(&path),
+        Duration::from_secs(30),
+        16 * 1024 * 1024,
+        256 * 1024,
+    )?;
     if !output.status.success() {
         return Err(format!("无法解析媒体：{}", tail_text(&output.stderr, 1600)));
     }
@@ -1203,14 +1311,39 @@ enum PipeLine {
     Error(String),
 }
 
+/// Consume the whole line, retaining only its bounded prefix. Limiting after
+/// `read_until` would still allocate the entire untrusted diagnostic line.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<bool> {
+    buffer.clear();
+    let mut consumed_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(consumed_any);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let retained = consumed.min(limit.saturating_sub(buffer.len()));
+        buffer.extend_from_slice(&available[..retained]);
+        reader.consume(consumed);
+        consumed_any = true;
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
 fn read_pipe(reader: impl Read, sender: mpsc::SyncSender<PipeLine>, progress: bool) {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
+        match read_bounded_line(&mut reader, &mut buffer, 8_000) {
+            Ok(false) | Err(_) => break,
+            Ok(true) => {
                 let line: String = String::from_utf8_lossy(&buffer)
                     .trim()
                     .chars()
@@ -1232,6 +1365,17 @@ fn read_pipe(reader: impl Read, sender: mpsc::SyncSender<PipeLine>, progress: bo
     }
 }
 
+fn output_location_error(action: &str, path: &Path, error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        format!(
+            "输出文件夹没有写入权限：{}。请选择当前用户可写入的文件夹。\n{error}",
+            path.display()
+        )
+    } else {
+        format!("{action}（{}）：{error}", path.display())
+    }
+}
+
 /// Encode into a privately created folder, then exclusively create the destination.
 /// This prevents failed/cancelled tasks from removing or overwriting unrelated files.
 pub fn run(
@@ -1246,7 +1390,8 @@ pub fn run(
         return Err("输出计划无效。".into());
     }
     let directory = plan.output.parent().ok_or("输出路径无效。")?;
-    fs::create_dir_all(directory).map_err(|e| format!("无法创建输出文件夹：{e}"))?;
+    fs::create_dir_all(directory)
+        .map_err(|error| output_location_error("无法创建输出文件夹", directory, error))?;
     let stage = Stage::new(
         directory,
         plan.output.extension().unwrap_or(OsStr::new("tmp")),
@@ -1330,12 +1475,14 @@ fn execute(
     offset: f32,
     weight: f32,
 ) -> Result<(), String> {
-    let mut child = command(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("无法启动 FFmpeg：{e}"))?;
+    let mut child = ChildGuard(
+        command(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动 FFmpeg：{e}"))?,
+    );
     on_event(ProgressEvent::Log(format!(
         "FFmpeg 已启动（进程 {}）。",
         child.id()
@@ -1473,7 +1620,13 @@ impl Stage {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(format!("无法创建导出临时文件夹：{error}")),
+                Err(error) => {
+                    return Err(output_location_error(
+                        "无法创建导出临时文件夹",
+                        parent,
+                        error,
+                    ));
+                }
             }
         }
         Err("无法分配导出临时文件夹。".into())
@@ -1527,7 +1680,7 @@ fn publish(stage: &Path, desired: &Path, cancel: &AtomicBool) -> Result<PathBuf,
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("无法保存导出文件：{error}")),
+            Err(error) => return Err(output_location_error("无法保存导出文件", parent, error)),
         };
         let result = (|| {
             let mut source = File::open(stage)?;
@@ -1623,6 +1776,120 @@ mod tests {
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn process_fixture(mode: &str) -> Command {
+        let mut child = command(&env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "media::tests::media_process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FRAMEFLOW_MEDIA_PROCESS_FIXTURE", mode);
+        child
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by the bounded process tests"]
+    fn media_process_fixture() {
+        match env::var("FRAMEFLOW_MEDIA_PROCESS_FIXTURE").as_deref() {
+            Ok("stdout-flood") => {
+                let _ = io::stdout().write_all(&vec![b'x'; 128 * 1024]);
+            }
+            Ok("stderr-flood") => {
+                let _ = io::stderr().write_all(&vec![b'x'; 128 * 1024]);
+            }
+            Ok("hang") => {}
+            _ => return,
+        }
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn media_probe_timeout_bounds_the_complete_process() {
+        let started = Instant::now();
+        let error = bounded_output(
+            &mut process_fixture("hang"),
+            Duration::from_millis(500),
+            4096,
+            4096,
+        )
+        .unwrap_err();
+        assert!(error.contains("超时"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn media_probe_output_limits_stop_noisy_processes() {
+        for mode in ["stdout-flood", "stderr-flood"] {
+            let error = bounded_output(
+                &mut process_fixture(mode),
+                Duration::from_secs(5),
+                4096,
+                4096,
+            )
+            .unwrap_err();
+            assert!(error.contains("超过大小限制"), "{mode}: {error}");
+        }
+    }
+
+    #[test]
+    fn media_child_guard_reaps_the_process_during_unwind() {
+        let mut child = ChildGuard(
+            process_fixture("hang")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = stdout.read_to_end(&mut Vec::new());
+            let _ = sender.send(result);
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned_child = child;
+            panic!("simulated worker panic");
+        }));
+        assert!(result.is_err());
+        receiver
+            .recv_timeout(Duration::from_secs(4))
+            .expect("dropping the guard must terminate the child and close its pipe")
+            .unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn media_pipe_discards_an_oversized_line_without_losing_the_next_one() {
+        let mut bytes = vec![b'x'; 1024 * 1024];
+        bytes.extend_from_slice(b"\nspeed=1.0x\nlast line");
+        let mut reader = BufReader::new(bytes.as_slice());
+        let mut line = Vec::new();
+        assert!(read_bounded_line(&mut reader, &mut line, 8_000).unwrap());
+        assert_eq!(line, vec![b'x'; 8_000]);
+        assert!(read_bounded_line(&mut reader, &mut line, 8_000).unwrap());
+        assert_eq!(line, b"speed=1.0x\n");
+        assert!(read_bounded_line(&mut reader, &mut line, 8_000).unwrap());
+        assert_eq!(line, b"last line");
+        assert!(!read_bounded_line(&mut reader, &mut line, 8_000).unwrap());
+    }
+
+    #[test]
+    fn media_startup_failure_cleans_only_its_staging_files() {
+        let fixture = Fixture::new();
+        let untouched = fixture.directory.join("user-file.txt");
+        fs::write(&untouched, b"preserved").unwrap();
+        let mut job = plan(&tools(), &fixture.media, &ExportSettings::default()).unwrap();
+        job.program = fixture.directory.join("missing-ffmpeg");
+        assert!(run(job, Arc::new(AtomicBool::new(false)), |_| {}).is_err());
+        assert_eq!(fs::read(&untouched).unwrap(), b"preserved");
+        assert_eq!(fs::read(&fixture.media.path).unwrap(), b"fixture");
+        assert_eq!(fixture.directory.read_dir().unwrap().count(), 2);
     }
 
     #[test]

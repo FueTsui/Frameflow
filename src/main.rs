@@ -6,6 +6,7 @@ mod effects;
 mod encoding;
 mod icons;
 mod media;
+mod single_instance;
 mod software_update;
 mod theme;
 mod timecode;
@@ -14,6 +15,20 @@ mod updater;
 
 fn main() -> eframe::Result {
     let capture_mode = std::env::var_os("FRAMEFLOW_SCREENSHOT").is_some();
+    let mut instance = if capture_mode {
+        None
+    } else {
+        match single_instance::Instance::acquire() {
+            Ok(Some(instance)) => Some(instance),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                startup_error(&format!(
+                    "无法建立运行实例：{error}\n请检查当前用户数据目录的访问权限后重试。"
+                ));
+                return Err(eframe::Error::AppCreation(Box::new(error)));
+            }
+        }
+    };
     // Snapshot runs must not load saved window geometry or alter user preferences.
     let capture_storage = capture_mode.then(|| {
         let nonce = std::time::SystemTime::now()
@@ -51,10 +66,30 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Frameflow",
         options,
-        Box::new(|cc| Ok(Box::new(app::Frameflow::new(cc)))),
+        Box::new(|cc| {
+            let app = app::Frameflow::new(cc);
+            if let Some(instance) = &mut instance {
+                instance.attach(&cc.egui_ctx, app.launch_handler())?;
+            }
+            Ok(Box::new(app))
+        }),
     );
     if let Some(path) = capture_storage {
         let _ = std::fs::remove_file(path);
     }
+    if let Err(error) = &result {
+        startup_error(&format!(
+            "窗口启动失败：{error}\n请检查显卡驱动和当前桌面会话后重试。"
+        ));
+    }
     result
+}
+
+fn startup_error(message: &str) {
+    eprintln!("Frameflow: {message}");
+    rfd::MessageDialog::new()
+        .set_title("帧流 Frameflow — 无法启动")
+        .set_level(rfd::MessageLevel::Error)
+        .set_description(message)
+        .show();
 }

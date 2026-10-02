@@ -17,7 +17,7 @@
 #else
   #define InstallerAppId "{{D295879C-B658-4909-9644-761727F06486}"
   #define InstallerAppName "帧流 Frameflow"
-  #define InstallerDefaultDir "C:\Programs\Frameflow"
+  #define InstallerDefaultDir "{localappdata}\Programs\Frameflow"
 #endif
 
 [Setup]
@@ -27,6 +27,7 @@ AppVersion={#AppVersion}
 AppVerName={#InstallerAppName} {#AppVersion}
 AppPublisher=Frameflow
 DefaultDirName={#InstallerDefaultDir}
+; Keep upgrading existing writable installations in place, including the legacy path.
 UsePreviousAppDir=yes
 AppendDefaultDirName=no
 DisableDirPage=no

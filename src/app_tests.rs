@@ -4,6 +4,131 @@
 use super::*;
 use egui::{Event, FullOutput, Modifiers, PointerButton, Pos2, RawInput, Theme};
 
+fn has_viewport_command(output: &FullOutput, expected: egui::ViewportCommand) -> bool {
+    output.viewport_output[&egui::ViewportId::ROOT]
+        .commands
+        .contains(&expected)
+}
+
+#[test]
+fn close_idle_window_does_not_require_confirmation() {
+    let mut ui = Harness::new();
+    let output = ui.close_frame(true);
+    assert_eq!(ui.app.close_state, CloseState::Open);
+    assert!(!has_viewport_command(
+        &output,
+        egui::ViewportCommand::CancelClose
+    ));
+}
+
+#[test]
+fn close_running_task_requires_confirmation_and_waits_for_worker_cleanup() {
+    let mut ui = Harness::new();
+    let running = ui.add_file("running.mp4");
+    ui.add_file("queued.mp4");
+    ui.app.entries[0].status = Status::Running;
+    ui.app.entries[1].status = Status::Queued;
+    ui.app.batch = true;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    ui.app.active = Some((running, cancellation.clone()));
+    let (release, wait) = mpsc::channel();
+    let (done, cleaned) = mpsc::channel();
+    let tx = ui.app.tx.clone();
+    ui.app.worker = Some(thread::spawn(move || {
+        wait.recv().unwrap();
+        tx.send(Message::Finished(running, Err("已取消".into())))
+            .unwrap();
+        done.send(()).unwrap();
+    }));
+
+    let output = ui.close_frame(true);
+    assert!(has_viewport_command(
+        &output,
+        egui::ViewportCommand::CancelClose
+    ));
+    assert_eq!(ui.app.close_state, CloseState::Confirming);
+    assert!(!cancellation.load(Ordering::Relaxed));
+
+    let output = ui.settle();
+    ui.click(painted_text_bounds(&output, "继续使用").0.center());
+    assert_eq!(ui.app.close_state, CloseState::Open);
+    assert!(!cancellation.load(Ordering::Relaxed));
+
+    ui.close_frame(true);
+    let output = ui.settle();
+    ui.click(painted_text_bounds(&output, "取消任务并退出").0.center());
+    assert_eq!(ui.app.close_state, CloseState::Waiting);
+    assert!(cancellation.load(Ordering::Relaxed));
+    assert!(!ui.app.batch);
+    assert!(ui.app.entries[1].status == Status::Ready);
+    let output = ui.close_frame(true);
+    assert!(has_viewport_command(
+        &output,
+        egui::ViewportCommand::CancelClose
+    ));
+    assert!(!has_viewport_command(&output, egui::ViewportCommand::Close));
+
+    release.send(()).unwrap();
+    cleaned.recv_timeout(Duration::from_secs(2)).unwrap();
+    let output = ui.close_frame(false);
+    assert_eq!(ui.app.close_state, CloseState::Ready);
+    assert!(ui.app.active.is_none());
+    assert!(ui.app.worker.is_none());
+    assert!(ui.app.entries[0].status == Status::Cancelled);
+    assert!(has_viewport_command(&output, egui::ViewportCommand::Close));
+    assert!(!has_viewport_command(
+        &ui.close_frame(true),
+        egui::ViewportCommand::CancelClose
+    ));
+}
+
+#[test]
+fn close_engine_installation_waits_for_result_before_exiting() {
+    for result in [Ok(PathBuf::from("managed-engine")), Err("下载失败".into())] {
+        let mut ui = Harness::new();
+        ui.app.update_status = UpdateStatus::Installing;
+        let output = ui.close_frame(true);
+        assert!(has_viewport_command(
+            &output,
+            egui::ViewportCommand::CancelClose
+        ));
+        let output = ui.settle();
+        ui.click(painted_text_bounds(&output, "完成更新后退出").0.center());
+        assert_eq!(ui.app.close_state, CloseState::Waiting);
+        assert!(!has_viewport_command(
+            &ui.close_frame(false),
+            egui::ViewportCommand::Close
+        ));
+        ui.app.tx.send(Message::UpdateInstalled(result)).unwrap();
+        let output = ui.close_frame(false);
+        assert_eq!(ui.app.close_state, CloseState::Ready);
+        assert!(has_viewport_command(&output, egui::ViewportCommand::Close));
+    }
+}
+
+#[test]
+fn close_confirmation_defers_new_work_and_refreshes_engine_when_dismissed() {
+    let mut ui = Harness::new();
+    ui.app.close_state = CloseState::Confirming;
+    ui.app.update_status = UpdateStatus::Installing;
+    ui.app.import(vec!["later.mp4".into()], &ui.context);
+    ui.app.dialog(&ui.context, 0);
+    ui.app.start_batch(&ui.context);
+    assert_eq!(ui.app.pending_files, [PathBuf::from("later.mp4")]);
+    assert!(!ui.app.dialog_open);
+    assert!(!ui.app.batch);
+    ui.app
+        .tx
+        .send(Message::UpdateInstalled(Ok("engine".into())))
+        .unwrap();
+    ui.close_frame(false);
+    assert!(!ui.app.checking);
+    let output = ui.settle();
+    ui.click(painted_text_bounds(&output, "继续使用").0.center());
+    assert_eq!(ui.app.close_state, CloseState::Open);
+    assert!(ui.app.checking);
+}
+
 struct Harness {
     app: Frameflow,
     context: egui::Context,
@@ -32,6 +157,7 @@ impl Harness {
                 rx,
                 active: None,
                 worker: None,
+                close_state: CloseState::Open,
                 batch: false,
                 command_open: false,
                 page: WorkspacePage::Files,
@@ -115,6 +241,31 @@ impl Harness {
             }
         });
         (output, overlay_clicked)
+    }
+
+    fn close_frame(&mut self, requested: bool) -> FullOutput {
+        self.time += 1.0 / 30.0;
+        let mut input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.viewport)),
+            time: Some(self.time),
+            focused: true,
+            system_theme: Some(self.system_theme),
+            ..Default::default()
+        };
+        if requested {
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let app = &mut self.app;
+        self.context.run(input, |ctx| {
+            app.handle_close_request(ctx);
+            app.drain(ctx);
+            app.render_ui(ctx, theme::apply(ctx));
+        })
     }
 
     fn settle(&mut self) -> FullOutput {
@@ -1342,9 +1493,55 @@ fn missing_engine_import_routes_to_preferences_page() {
         .import(vec![PathBuf::from("missing-engine.mp4")], &ui.context);
     assert!(ui.app.page == WorkspacePage::Preferences);
     assert!(ui.app.notice.is_some());
+    assert_eq!(ui.app.pending_files, [PathBuf::from("missing-engine.mp4")]);
     let output = ui.settle();
     assert!(painted_text_bounds_if_present(&output, "选择引擎文件夹").is_some());
     assert!(painted_text_bounds_if_present(&output, "开始处理").is_none());
+}
+
+#[test]
+fn secondary_launch_preserves_files_while_engine_detection_or_updates_are_pending() {
+    let mut ui = Harness::new();
+    ui.app.launch_handler()(Vec::new());
+    ui.app.drain(&ui.context);
+    assert!(ui.app.notice.is_none());
+    assert!(ui.app.page == WorkspacePage::Files);
+    ui.app.checking = true;
+    let launch = ui.app.launch_handler();
+    launch(vec![PathBuf::from("startup.mp4")]);
+    ui.app.drain(&ui.context);
+    assert_eq!(ui.app.pending_files, [PathBuf::from("startup.mp4")]);
+    assert!(ui.app.notice.is_none());
+    assert!(ui.app.entries.is_empty());
+
+    // A failed initial engine check must retain the request for a later retry.
+    ui.app
+        .tx
+        .send(Message::Tools(Err("引擎暂不可用".into())))
+        .unwrap();
+    ui.app.drain(&ui.context);
+    launch(vec![PathBuf::from("after-failure.mp4")]);
+    ui.app.drain(&ui.context);
+    assert_eq!(ui.app.pending_files.len(), 2);
+    assert!(ui.app.notice.is_some());
+
+    ui.app.update_status = UpdateStatus::Installing;
+    launch(vec![PathBuf::from("during-update.mp4")]);
+    ui.app.drain(&ui.context);
+    assert_eq!(ui.app.pending_files.len(), 3);
+}
+
+#[test]
+fn secondary_launch_uses_the_normal_import_path_when_the_engine_is_ready() {
+    let mut ui = Harness::new();
+    ui.app.tools = Some(Arc::new(fixture_tools("9.0.1")));
+    ui.app.launch_handler()(vec![PathBuf::from("not-an-existing-media-file.mp4")]);
+    ui.app.drain(&ui.context);
+    assert!(ui.app.pending_files.is_empty());
+    assert_eq!(
+        ui.app.notice.as_deref(),
+        Some("请添加媒体文件，暂不支持导入整个文件夹。")
+    );
 }
 
 #[test]

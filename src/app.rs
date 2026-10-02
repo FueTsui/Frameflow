@@ -89,6 +89,15 @@ enum UpdateStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+enum CloseState {
+    #[default]
+    Open,
+    Confirming,
+    Waiting,
+    Ready,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
     Analyzing,
@@ -221,6 +230,7 @@ pub struct Frameflow {
     rx: Receiver<Message>,
     active: Option<(u64, Arc<AtomicBool>)>,
     worker: Option<thread::JoinHandle<()>>,
+    close_state: CloseState,
     batch: bool,
     command_open: bool,
     page: WorkspacePage,
@@ -244,6 +254,15 @@ pub struct Frameflow {
 }
 
 impl Frameflow {
+    pub fn launch_handler(&self) -> Box<dyn Fn(Vec<PathBuf>) + Send> {
+        let tx = self.tx.clone();
+        Box::new(move |paths| {
+            if !paths.is_empty() {
+                let _ = tx.send(Message::Files(paths));
+            }
+        })
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut prefs: Preferences = cc
             .storage
@@ -274,6 +293,7 @@ impl Frameflow {
             rx,
             active: None,
             worker: None,
+            close_state: CloseState::Open,
             batch: false,
             command_open: false,
             page: WorkspacePage::Files,
@@ -385,7 +405,8 @@ impl Frameflow {
     }
 
     fn dialog(&mut self, ctx: &egui::Context, kind: u8) {
-        if self.dialog_open
+        if self.close_state != CloseState::Open
+            || self.dialog_open
             || (kind >= 3 && self.batch)
             || (kind == 2 && (self.engine_change_locked() || self.checking))
         {
@@ -469,12 +490,17 @@ impl Frameflow {
     }
 
     fn import(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if self.close_state != CloseState::Open || self.checking {
+            self.pending_files.extend(paths);
+            return;
+        }
         if self.update_status == UpdateStatus::Installing || self.software_update.busy() {
             self.pending_files.extend(paths);
             self.notice = Some("更新期间暂不添加文件，请稍后再试。".into());
             return;
         }
         let Some(tools) = self.tools.clone() else {
+            self.pending_files.extend(paths);
             self.notice = Some("请先在设置中配置 FFmpeg，再添加媒体文件。".into());
             self.page = WorkspacePage::Preferences;
             return;
@@ -751,7 +777,7 @@ impl Frameflow {
                 }
             }
         }
-        if !self.checking && !self.auto_update_checked {
+        if self.close_state == CloseState::Open && !self.checking && !self.auto_update_checked {
             self.auto_update_checked = true;
             if self.prefs.auto_check_updates && self.background_updates_allowed() {
                 self.check_engine_updates(ctx);
@@ -760,9 +786,10 @@ impl Frameflow {
         self.software_update.poll(
             ctx,
             self.prefs.auto_check_app_updates,
-            self.background_updates_allowed(),
+            self.background_updates_allowed() && self.close_state == CloseState::Open,
         );
-        if !self.software_update.busy()
+        if self.close_state == CloseState::Open
+            && !self.software_update.busy()
             && self.update_status != UpdateStatus::Installing
             && !self.checking
             && self.tools.is_some()
@@ -771,9 +798,10 @@ impl Frameflow {
             let paths = std::mem::take(&mut self.pending_files);
             self.import(paths, ctx);
         }
-        if self.batch && self.active.is_none() {
+        if self.close_state == CloseState::Open && self.batch && self.active.is_none() {
             self.run_next(ctx);
         }
+        self.finish_close(ctx);
     }
 
     fn background_updates_allowed(&self) -> bool {
@@ -781,7 +809,8 @@ impl Frameflow {
     }
 
     fn engine_change_locked(&self) -> bool {
-        self.active.is_some()
+        self.close_state != CloseState::Open
+            || self.active.is_some()
             || self.batch
             || self.update_status == UpdateStatus::Installing
             || self.software_update.busy()
@@ -882,7 +911,8 @@ impl Frameflow {
             self.page = WorkspacePage::Export;
             return;
         }
-        if self.active.is_some()
+        if self.close_state != CloseState::Open
+            || self.active.is_some()
             || self.tools.is_none()
             || self.dialog_open
             || self.checking
@@ -949,10 +979,13 @@ impl Frameflow {
                     let (tx, ctx) = (self.tx.clone(), ctx.clone());
                     self.worker = Some(thread::spawn(move || {
                         let (progress_tx, progress_ctx) = (tx.clone(), ctx.clone());
-                        let result = media::run(plan, cancel, move |event| {
-                            let _ = progress_tx.send(Message::Progress(id, event));
-                            progress_ctx.request_repaint();
-                        });
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            media::run(plan, cancel, move |event| {
+                                let _ = progress_tx.send(Message::Progress(id, event));
+                                progress_ctx.request_repaint();
+                            })
+                        }))
+                        .unwrap_or_else(|_| Err("媒体处理意外终止，请查看日志后重试。".into()));
                         let _ = tx.send(Message::Finished(id, result));
                         ctx.request_repaint();
                     }));
@@ -972,6 +1005,108 @@ impl Frameflow {
             if e.status == Status::Queued {
                 e.status = Status::Ready;
             }
+        }
+    }
+
+    fn update_in_progress(&self) -> bool {
+        self.update_status == UpdateStatus::Installing || self.software_update.downloading()
+    }
+
+    fn close_needs_confirmation(&self) -> bool {
+        self.active.is_some() || self.batch || self.update_in_progress()
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.close_state == CloseState::Open && self.close_needs_confirmation() {
+            self.close_state = CloseState::Confirming;
+        }
+        if matches!(
+            self.close_state,
+            CloseState::Confirming | CloseState::Waiting
+        ) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
+    fn confirm_close(&mut self, ctx: &egui::Context) {
+        self.cancel();
+        self.close_state = CloseState::Waiting;
+        self.finish_close(ctx);
+    }
+
+    fn dismiss_close(&mut self, ctx: &egui::Context) {
+        self.close_state = CloseState::Open;
+        // An installation may have completed while the confirmation was open;
+        // tool detection was held back with other new background work.
+        if self.update_status == UpdateStatus::Installed {
+            self.check_tools(ctx);
+        }
+    }
+
+    fn finish_close(&mut self, ctx: &egui::Context) {
+        if self.close_state == CloseState::Waiting {
+            if self.active.is_none() && self.worker.is_none() && !self.update_in_progress() {
+                self.close_state = CloseState::Ready;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !matches!(
+            self.close_state,
+            CloseState::Confirming | CloseState::Waiting
+        ) {
+            return;
+        }
+        let waiting = self.close_state == CloseState::Waiting;
+        let updating = self.update_in_progress();
+        let response = egui::Modal::new(egui::Id::new("safe-close")).show(ctx, |ui| {
+            ui.set_width(360.);
+            ui.heading(if waiting {
+                "正在准备退出"
+            } else {
+                "确认退出帧流？"
+            });
+            ui.add_space(8.);
+            ui.label(if updating {
+                "更新正在下载或安装。退出前将等待更新完成，以确保文件完整。"
+            } else if waiting {
+                "正在停止媒体处理并清理临时文件，完成后自动退出。"
+            } else {
+                "退出将取消当前处理和排队任务。已完成的文件会保留。"
+            });
+            ui.add_space(12.);
+            ui.horizontal(|ui| {
+                if waiting {
+                    ui.spinner();
+                    if ui.button("留在软件").clicked() {
+                        self.dismiss_close(ctx);
+                    }
+                } else {
+                    if ui.button("继续使用").clicked() {
+                        self.dismiss_close(ctx);
+                    }
+                    if ui
+                        .button(if updating {
+                            "完成更新后退出"
+                        } else {
+                            "取消任务并退出"
+                        })
+                        .clicked()
+                    {
+                        self.confirm_close(ctx);
+                    }
+                }
+            });
+        });
+        if !waiting && response.should_close() && self.close_state == CloseState::Confirming {
+            self.dismiss_close(ctx);
         }
     }
 
@@ -2508,7 +2643,8 @@ impl Frameflow {
     }
 
     fn software_update_settings(&mut self, ui: &mut Ui, ctx: &egui::Context, p: Palette) {
-        let blocked = self.active.is_some()
+        let blocked = self.close_state != CloseState::Open
+            || self.active.is_some()
             || self.batch
             || self.checking
             || self.dialog_open
@@ -2691,8 +2827,8 @@ impl Frameflow {
 
     fn render_ui(&mut self, ctx: &egui::Context, p: Palette) {
         self.sync_time_inputs();
-        let shortcut_start =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+        let shortcut_start = self.close_state == CloseState::Open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         self.sidebar(ctx, p);
         let button_start = self.export_panel(ctx, p);
         self.workspace(ctx, p);
@@ -2707,6 +2843,7 @@ impl Frameflow {
         if self.command_open {
             self.commands(ctx, p);
         }
+        self.close_dialog(ctx);
     }
 
     fn commands(&mut self, ctx: &egui::Context, p: Palette) {
@@ -2828,6 +2965,7 @@ impl Frameflow {
 
 impl eframe::App for Frameflow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close_request(ctx);
         self.drain(ctx);
         self.sync_time_inputs();
         let p = theme::apply(ctx);
